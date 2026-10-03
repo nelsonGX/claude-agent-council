@@ -1,0 +1,9 @@
+{
+  "name": "agent-council",
+  "version": "0.2.0",
+  "description": "Group discussion between Claude and other coding agents (Codex, OpenCode, Grok) over a shared transcript, with @mentions, before committing to a conclusion.",
+  "author": {
+    "name": "nelsonGX"
+  },
+  "license": "MIT"
+}
