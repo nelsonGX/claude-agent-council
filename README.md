@@ -29,11 +29,18 @@ To use a local checkout instead, run `/plugin marketplace add <path-to-this-repo
 
 Ask Claude for it: "council this with codex and grok", "get a second opinion on this plan", or invoke `/agent-council:council`.
 
-To check which agents the script can find:
+To check which agents the script can find, ask Claude to "run the council check". From a clone of this repo you can also run it yourself:
 
 ```
-python plugins/agent-council/scripts/council.py --check
+python3 plugins/agent-council/scripts/council.py --check
 ```
+
+On Windows, use `python` if `python3` isn't found or opens the Microsoft Store.
+
+## Troubleshooting
+
+- **An agent shows `NOT FOUND` but works in your terminal.** The script finds agents on the `PATH` it inherits from Claude Code. If you started Claude Code from the Dock, Finder or a desktop launcher, that `PATH` may be missing directories your shell profile adds, such as `/opt/homebrew/bin`, `~/.local/bin` or an npm/fnm/nvm global bin. Start Claude Code from a terminal, or make those directories available to GUI apps.
+- **An agent shows `UNAVAILABLE (quota)` or `UNAVAILABLE (auth)`.** Its CLI reported that it's out of credits or not logged in. Fix that in the agent's own CLI. The council keeps going with the others and tries it again next round.
 
 The full moderation protocol, flags and environment variables are documented in [`skills/council/SKILL.md`](plugins/agent-council/skills/council/SKILL.md).
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Group discussion between Claude and other coding agents over a shared transcript.
 
-    python council.py <transcript.md> "<message>"         (or pipe the message on stdin)
-    python council.py <transcript.md> "@codex @grok <message>"
-    python council.py <transcript.md> --agents codex,grok "<message>"
-    python council.py --check                              (which agents are installed)
+    python3 council.py <transcript.md> "<message>"         (or pipe the message on stdin)
+    python3 council.py <transcript.md> "@codex @grok <message>"
+    python3 council.py <transcript.md> --agents codex,grok "<message>"
+    python3 council.py --check                              (which agents are installed)
 
 Appends <message> as Claude's turn, sends the transcript to the agents it
 @mentions (or to every selected agent if it mentions none, or @all) in parallel
@@ -48,6 +48,15 @@ TIMEOUT = int(os.environ.get("COUNCIL_TIMEOUT", "420"))
 # still fits the ~8 minute Bash budget.
 FAST_FAIL = 60
 RETRY_TIMEOUT = 90
+RATE_LIMIT_WAIT = 20
+# Failures a retry can't fix this round, matched in the agent's error output.
+UNAVAILABLE = [
+    ("quota", re.compile(r"(?:status|http_status)\W{0,3}402\b|payment required|quota|balance exhausted"
+                         r"|insufficient (?:credit|balance|funds)|usage limit|out of credits", re.I)),
+    ("auth", re.compile(r"(?:status|http_status)\W{0,3}401\b|unauthori[sz]ed|not logged in|log ?in required"
+                        r"|please (?:log|sign) ?in|invalid api key", re.I)),
+]
+RATE_LIMITED = re.compile(r"(?:status|http_status)\W{0,3}429\b|rate.?limit|too many requests", re.I)
 # Above this many characters, old agent replies are collapsed in the prompt
 # (never in the file on disk).
 PROMPT_BUDGET = int(os.environ.get("COUNCIL_PROMPT_CHARS", "60000"))
@@ -327,11 +336,16 @@ def ask_grok(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
         except ValueError:
             continue
         if isinstance(event, dict) and event.get("type") == "result":
-            if event.get("is_error") or not (event.get("result") or "").strip():
-                # The event ends with a long usage block; the reason is in `errors`.
-                raise Failed(tail(json.dumps(event.get("errors") or event)))
             # `result` is the final message only, without the progress chatter.
-            return event["result"].strip(), code
+            result = (event.get("result") or "").strip()
+            # The event ends with a long usage block; the reason is in `errors`.
+            error = tail(json.dumps(event.get("errors") or event))
+            if not result:
+                raise Failed(error)
+            if event.get("is_error"):
+                # E.g. the quota ran out mid-turn: keep what it wrote, flagged.
+                return f"(warning: Grok stopped with an error; reply may be incomplete: {error})\n\n{result}", code
+            return result, code
     raise Failed(tail(stderr or stdout))
 
 
@@ -348,6 +362,7 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)*?)(?<!`)\1(?!`)", re.S)
 # "@codex", "@Grok," ... but not emails, paths or "x@grok".
 MENTION = re.compile(rf"(?<![\w@./\\-])@({'|'.join(LABELS)}|all)\b", re.I)
+NO_REPLY = re.compile(r"\(no reply: [^\n]*?(?:unavailable: (\w+))?\)")
 STATUS = re.compile(r"^[\s*_`-]*status[*_`]*\s*[:\-]\s*[*_`]*\s*(AGREE|DISAGREE|NEED-INFO)\b", re.I)
 
 
@@ -406,6 +421,14 @@ def close_fences(reply: str) -> str:
     return f"{reply}\n{fence}" if fence else reply
 
 
+def unavailable_reason(error: str) -> str | None:
+    """"quota" or "auth" when an agent's error output says retrying can't help, else None."""
+    for reason, pattern in UNAVAILABLE:
+        if pattern.search(error):
+            return reason
+    return None
+
+
 def ask(label: str, fn, prompt: str, cwd: Path) -> tuple[str, float]:
     start = time.monotonic()
     timeout = TIMEOUT
@@ -421,7 +444,17 @@ def ask(label: str, fn, prompt: str, cwd: Path) -> tuple[str, float]:
             reply = f"(no reply: {label} timed out after {timeout}s)"
             break
         except Exception as exc:  # noqa: BLE001 — any failure becomes a visible transcript entry
+            reason = unavailable_reason(str(exc))
+            if reason:
+                # Out of quota or logged out: a retry would fail the same way.
+                reply = f"(no reply: {label} unavailable: {reason})\n{exc}"
+                break
             reply = f"(no reply: {label} failed)\n{exc}"
+            if attempt == 1 and RATE_LIMITED.search(str(exc)):
+                print(f"[council] {label} rate limited, retrying once in {RATE_LIMIT_WAIT}s", file=sys.stderr, flush=True)
+                time.sleep(RATE_LIMIT_WAIT)
+                timeout = RETRY_TIMEOUT
+                continue
             if attempt == 1 and time.monotonic() - start < FAST_FAIL:
                 print(f"[council] {label} failed fast, retrying once: {str(exc)[:200]}", file=sys.stderr, flush=True)
                 timeout = RETRY_TIMEOUT
@@ -433,8 +466,9 @@ def ask(label: str, fn, prompt: str, cwd: Path) -> tuple[str, float]:
 
 
 def status_of(reply: str) -> str:
-    if reply.startswith("(no reply"):
-        return "NO-REPLY"
+    m = NO_REPLY.match(reply)
+    if m:
+        return f"UNAVAILABLE ({m.group(1)})" if m.group(1) else "NO-REPLY"
     lines = [l for l in reply.splitlines() if l.strip()]
     m = STATUS.match(lines[-1]) if lines else None
     return m.group(1).upper() if m else "?"
@@ -581,7 +615,6 @@ def main() -> None:
 
     # Agents can pull in each other only from the pool (--agents) plus whoever Claude named.
     allowed = [key for key in AGENTS if key in installed and (key in wanted or key in targets)]
-    mentionable = ", ".join([*(f"@{AGENTS[key][0]}" for key in allowed), "@Claude"])
     participants = list(targets)
     print(f"[council] round {round_no}: asking {', '.join(AGENTS[k][0] for k in targets)} in {cwd} "
           f"(timeout {TIMEOUT}s, follow-ups {args.hops})", file=sys.stderr, flush=True)
@@ -594,6 +627,7 @@ def main() -> None:
     hop = 0
     while batch:
         roster = ", ".join(["Claude", *(AGENTS[k][0] for k in participants)])
+        mentionable = ", ".join([*(f"@{AGENTS[key][0]}" for key in allowed), "@Claude"])
         view = prompt_view(text, round_no, transcript)
         if view is not text and hop == 0:
             print(f"[council] transcript is {len(text)} chars; collapsed old replies to {len(view)} for the prompt",
@@ -619,6 +653,11 @@ def main() -> None:
         callers: dict[str, list[str]] = {}
         for key, reply, took in results:
             latest[key] = (reply, latest.get(key, ("", 0.0))[1] + took)
+            if status_of(reply).startswith("UNAVAILABLE") and key in allowed:
+                # Out of quota or logged out: don't offer or ask it again this round.
+                allowed.remove(key)
+                print(f"[council] {AGENTS[key][0]} is {status_of(reply).lower()}; skipping it for the rest of "
+                      "this round", file=sys.stderr)
             if reply.startswith("(no reply"):
                 continue
             label = AGENTS[key][0]
@@ -630,7 +669,8 @@ def main() -> None:
                     callers.setdefault(m, []).append(label)
         skipped = [AGENTS[k][0] for k in callers if k not in allowed]
         if skipped:
-            print(f"[council] mentioned but not installed or not in --agents: {', '.join(skipped)}", file=sys.stderr)
+            print(f"[council] mentioned but not available (not installed, not in --agents, or out of quota): "
+                  f"{', '.join(skipped)}", file=sys.stderr)
         callers = {k: who for k, who in callers.items() if k in allowed}
         hop += 1
         if callers and hop > args.hops:

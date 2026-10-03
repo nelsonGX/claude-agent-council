@@ -12,10 +12,10 @@ A single agent tends to trust its own first idea and state guesses about the cod
 Keep one transcript file per topic in your scratchpad directory (or a temp dir if there is none):
 
 ```sh
-python "${CLAUDE_PLUGIN_ROOT}/scripts/council.py" <scratchpad>/council-<topic>.md "<your message for this round>"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/council.py" <scratchpad>/council-<topic>.md "<your message for this round>"
 ```
 
-(Use `python3` where `python` is not Python 3.)
+On Windows, use `python` if `python3` isn't found or opens the Microsoft Store. If the user asks for "the council check", or an agent unexpectedly isn't installed, run the script with `--check` and no transcript. If an agent the user has installed shows `NOT FOUND`, it's probably missing from the `PATH` Claude Code inherited (for example, it was launched from a GUI); tell the user that.
 
 **Run it in the background** (`run_in_background: true` on the Bash call) and keep working — read the code you'll need to verify their claims. You are notified when the round ends; then read the output. Don't start another round on the same transcript until it has finished.
 
@@ -38,7 +38,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/council.py" <scratchpad>/council-<topic>.m
 - Extra CLI flags per agent: `COUNCIL_CODEX_ARGS`, `COUNCIL_OPENCODE_ARGS`, `COUNCIL_GROK_ARGS` (for example `-m grok-4.7-build-fast` when Grok is too slow).
 - `--agents codex,grok` sets the default pool for messages without mentions (env `COUNCIL_AGENTS`). By default the script uses every installed agent and skips missing ones with a notice. `--check` shows which are installed.
 - For long messages, or ones with quotes or backticks, pipe the message on stdin, for example with a heredoc (`<<'EOF'`), instead of passing it as an argument.
-- A turn takes 1–6 minutes, Grok is usually the slowest, and follow-ups add another turn. `COUNCIL_TIMEOUT` (default 420 s) is the per-agent limit per turn. An agent that fails within 60 s is retried once with a 90 s limit. If you must run in the foreground, give the Bash call its maximum timeout and use `--hops 0`.
+- A turn takes 1–6 minutes, Grok is usually the slowest, and follow-ups add another turn. `COUNCIL_TIMEOUT` (default 420 s) is the per-agent limit per turn. An agent that fails within 60 s is retried once with a 90 s limit, and a rate-limited one (429) once after 20 s. An agent whose error says it is out of quota/credits or logged out is not retried: it shows as `UNAVAILABLE (quota)` or `UNAVAILABLE (auth)`, is skipped for the rest of the round (including follow-ups and the @mention list) and is tried fresh next round. Tell the user which agent is unavailable and why; don't treat its silence as agreement. A reply prefixed `(warning: Grok stopped with an error …)` is partial work kept from a turn that failed midway. If you must run in the foreground, give the Bash call its maximum timeout and use `--hops 0`.
 - Agent process trees are killed on timeout, and also if the script itself is killed (on Windows through a kill-on-close Job Object, on Unix through signal handlers, which can't catch SIGKILL).
 - If a previous call died before any reply was written, rerunning the same transcript replaces that unanswered round instead of duplicating it.
 - Once the transcript passes about 60k characters (`COUNCIL_PROMPT_CHARS`), agent replies older than the previous round are collapsed to their status line in the prompt only. The file keeps everything, and your own messages are always sent in full, so restate anything important in your latest message.
