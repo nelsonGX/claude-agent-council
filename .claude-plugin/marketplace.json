@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Let Claude Code debate with Codex, OpenCode and Grok before it commits to a conclusion.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "agent-council",
       "description": "Group discussion between Claude and other coding agents over a shared transcript, with @mentions.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "nelsonGX"
       },

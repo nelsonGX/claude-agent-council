@@ -1,11 +1,13 @@
 ---
 name: council
-description: Hold a back-and-forth group discussion with other coding agents (Codex, OpenCode, Grok) over a shared transcript before committing to a conclusion. Use for non-trivial work in any repo — planning a new feature or cross-module change, audits and reviews (security, billing, permissions, state machines, protocols), or before claiming "X is the cause / unused / safe / works like Y" without having verified it in the code. Also use when the user says "council", "ask codex/grok/opencode", "@codex", "get a second opinion" or "discuss with the other agents". Skip for trivial edits and questions already answered by reading the code.
+description: Hold a back-and-forth group discussion with other coding agents (Codex, OpenCode, Grok, or custom CLIs the user configured) over a shared transcript before committing to a conclusion. Use for non-trivial work in any repo — planning a new feature or cross-module change, audits and reviews (security, billing, permissions, state machines, protocols), or before claiming "X is the cause / unused / safe / works like Y" without having verified it in the code. Also use when the user says "council", "ask codex/grok/opencode", "@codex", "get a second opinion" or "discuss with the other agents". Skip for trivial edits and questions already answered by reading the code.
 ---
 
 # Council
 
 A single agent tends to trust its own first idea and state guesses about the code as fact. The council sends the same transcript to several other agents, which reply to you and to each other like a group chat, so claims get checked before you act on them.
+
+**The user's policy comes first.** If CLAUDE.md / AGENTS.md has an `agent-council:policy` section, follow it on when to run a council and whether to ask first. It overrides the generic triggers in this skill's description, in both directions. If the user says something like "always council before X" or "stop calling the council for Y", offer to save it with `/agent-council:setup`.
 
 ## Running a round
 
@@ -18,6 +20,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/council.py" <scratchpad>/council-<topic>.
 On Windows, use `python` if `python3` isn't found or opens the Microsoft Store. If the user asks for "the council check", or an agent unexpectedly isn't installed, run the script with `--check` and no transcript. If an agent the user has installed shows `NOT FOUND`, it's probably missing from the `PATH` Claude Code inherited (for example, it was launched from a GUI); tell the user that.
 
 **Run it in the background** (`run_in_background: true` on the Bash call) and keep working — read the code you'll need to verify their claims. You are notified when the round ends; then read the output. Don't start another round on the same transcript until it has finished.
+
+### Know your roster first
+
+At the start of a new council, run the script once with `--check` (it is instant and spends nothing). It shows each agent's install state, **cost tier**, **remaining turn budget** and **what the user says it's best at**, all from the user's config. If it says there's no config, carry on with every installed agent, and mention once that `/agent-council:setup` lets the user set budgets and strengths.
+
+Route by that profile:
+
+- **Strengths.** @mention the agents whose strengths fit the question, for example a backend/audit agent for a race condition and a security agent for an auth flow. Use the whole council for broad reviews. When an agent makes a claim outside its listed strengths, check it harder.
+- **Cost.** `free` agents can do broad sweeps and long back-and-forth. Save `limited` agents for the questions that match their strengths. Bring in `expensive` ones only for decisive points, in a focused message. Agents get the same guidance in their prompt, so they @mention each other accordingly.
+- **Budget.** Each round ends with `--- budget left: …`. An agent at 0 is skipped (`out of budget` on stderr) for the rest of that discussion or window. Plan around it, and tell the user when a budget is the reason an agent didn't take part. Don't work around the user's budget by re-running.
+- Agents with `auto_join: false` (shown as "joins only when @mentioned") never join a round unless **you** @mention them. Agents with `enabled: false` never take part.
 
 ### Addressing: @mentions
 
@@ -35,8 +48,10 @@ On Windows, use `python` if `python3` isn't found or opens the Microsoft Store. 
   - **OpenCode** runs with `--agent plan`, which denies edits but still allows its shell, so it stays read-only only because the model complies.
   - The script fingerprints `git status` and `git diff HEAD` (not counting the transcript) before and after each round, and appends a **WARNING** if the working tree changed. That check can't see ignored files, writes outside the repo, or directories that aren't git repos.
 - Grok has claimed to have written a file it never wrote. Treat any agent's claim about something it ran or did the same as its claims about code: unverified until you check.
-- Extra CLI flags per agent: `COUNCIL_CODEX_ARGS`, `COUNCIL_OPENCODE_ARGS`, `COUNCIL_GROK_ARGS` (for example `-m grok-4.7-build-fast` when Grok is too slow).
-- `--agents codex,grok` sets the default pool for messages without mentions (env `COUNCIL_AGENTS`). By default the script uses every installed agent and skips missing ones with a notice. `--check` shows which are installed.
+- **Config.** The user config (`--check` prints its path; override with env `COUNCIL_CONFIG`) holds each agent's `enabled`, `auto_join`, `cost`, `budget`, `strengths`, `avoid`, `notes`, `instructions` (a private role sent only to that agent), `args`, `timeout`, and custom agents with a `command`. An optional `<repo>/.agent-council.json` may add project-specific `strengths`/`avoid`/`notes`/`instructions`/`enabled`/`auto_join` only. To change the config, use `/agent-council:setup`. Config warnings are printed to stderr every round; pass them on.
+- Custom agents (any CLI added with a `command`) are **not** sandboxed by the script. Only their own flags and the post-round worktree check keep them read-only.
+- Extra CLI flags per agent: `args` in the config, or env `COUNCIL_<KEY>_ARGS` (e.g. `COUNCIL_GROK_ARGS="-m grok-4.7-build-fast"` when Grok is too slow).
+- `--agents codex,grok` sets the default pool for messages without mentions (env `COUNCIL_AGENTS`, config `defaults.agents`). By default the pool is every enabled agent with `auto_join`, and missing ones are skipped with a notice. Precedence: flag > env > project config > user config.
 - For long messages, or ones with quotes or backticks, pipe the message on stdin, for example with a heredoc (`<<'EOF'`), instead of passing it as an argument.
 - A turn takes 1–6 minutes, Grok is usually the slowest, and follow-ups add another turn. `COUNCIL_TIMEOUT` (default 420 s) is the per-agent limit per turn. An agent that fails within 60 s is retried once with a 90 s limit, and a rate-limited one (429) once after 20 s. An agent whose error says it is out of quota/credits or logged out is not retried: it shows as `UNAVAILABLE (quota)` or `UNAVAILABLE (auth)`, is skipped for the rest of the round (including follow-ups and the @mention list) and is tried fresh next round. Tell the user which agent is unavailable and why; don't treat its silence as agreement. A reply prefixed `(warning: Grok stopped with an error …)` is partial work kept from a turn that failed midway. If you must run in the foreground, give the Bash call its maximum timeout and use `--hops 0`.
 - Agent process trees are killed on timeout, and also if the script itself is killed (on Windows through a kill-on-close Job Object, on Unix through signal handlers, which can't catch SIGKILL).
@@ -47,6 +62,7 @@ On Windows, use `python` if `python3` isn't found or opens the Microsoft Store. 
 ## Moderating (you are the moderator, not just another voice)
 
 1. **Round 1: independent answers.** State the goal, the relevant paths and the constraints. Ask for their plan or findings. Don't give your own conclusion yet, so their answers aren't anchored to yours.
+   Pick the round-1 participants by strengths and cost (see "Know your roster first"), not always everyone.
 2. **Round 2 and later: debate.** Add your own view and what you verified yourself. Name the specific disagreements and @mention the agents who must defend or drop a point, for example: "@codex respond to Grok's claim X." Answer every line addressed to @Claude. Bring in new questions as they come up.
 3. **Stop** when everyone reaches `Status: AGREE` (which means the agent checked every code claim it relies on and has no remaining objection), when the remaining disagreement comes down to product intent (hand that to the user), or after about 4 rounds.
 

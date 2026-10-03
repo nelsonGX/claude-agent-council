@@ -4,7 +4,8 @@
     python3 council.py <transcript.md> "<message>"         (or pipe the message on stdin)
     python3 council.py <transcript.md> "@codex @grok <message>"
     python3 council.py <transcript.md> --agents codex,grok "<message>"
-    python3 council.py --check                              (which agents are installed)
+    python3 council.py --check [--json]                     (installed agents, profiles, budgets)
+    python3 council.py --init [--force]                     (write a starter config)
 
 Appends <message> as Claude's turn, sends the transcript to the agents it
 @mentions (or to every selected agent if it mentions none, or @all) in parallel
@@ -18,6 +19,10 @@ written, its unanswered round is reused instead of starting a duplicate.
 
 The agents work in the git root of the current directory (override with --cwd),
 so this script can live anywhere and be used from any repo.
+
+Agent profiles (enabled, cost tier, turn budgets, strengths, extra args, custom
+agents) come from a user config file and, for strengths and roles only, an
+optional .agent-council.json in the repo; see config_paths() and load_config().
 
 Cross-platform (macOS/Linux/Windows). Prompts go over stdin or a temp file
 rather than argv because Windows caps command lines (8191 chars through .cmd
@@ -41,7 +46,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 TIMEOUT = int(os.environ.get("COUNCIL_TIMEOUT", "420"))
 # A failure faster than this is retried once, with RETRY_TIMEOUT, so the round
@@ -68,7 +75,7 @@ GUARD = "COUNCIL_PARTICIPANT"
 
 PROMPT = """You are {name}, one of several coding agents ({roster}) in a group
 discussion about the repository at {cwd} (your current directory). Claude moderates.
-
+{role}
 Rules:
 - Read-only: inspect code freely, never modify files. Do not run council.py
   or start another group discussion; you are a participant in this one.
@@ -88,7 +95,7 @@ Rules:
   "Status: AGREE", "Status: DISAGREE" or "Status: NEED-INFO", plus a short reason.
   AGREE means you checked every code claim you rely on and have no remaining
   objection to the plan or conclusion on the table.
-
+{profiles}
 Transcript so far:
 {transcript}
 
@@ -231,9 +238,11 @@ def _install_cleanup() -> None:
         signal.signal(sig, handler)
 
 
-def run(cmd: list[str], cwd: Path, timeout: int, stdin: str | None = None) -> tuple[str, str, int]:
-    # Per-agent extras, e.g. COUNCIL_GROK_ARGS="-m grok-4.7-build-fast".
-    cmd = [*cmd, *shlex.split(os.environ.get(f"COUNCIL_{cmd[0].upper()}_ARGS", ""), posix=os.name != "nt")]
+def run(cmd: list[str], cwd: Path, timeout: int, stdin: str | None, agent: Agent) -> tuple[str, str, int]:
+    # Per-agent extras: "args" in the config, then e.g. COUNCIL_GROK_ARGS="-m grok-4.7-build-fast".
+    env_name = "COUNCIL_" + re.sub(r"\W", "_", agent.key).upper() + "_ARGS"
+    env_args = os.environ.get(env_name, "")
+    cmd = [*cmd, *agent.args, *shlex.split(env_args, posix=os.name != "nt")]
     exe = shutil.which(cmd[0])
     if exe is None:
         raise Failed(f"{cmd[0]} not found on PATH")
@@ -272,7 +281,7 @@ def tail(text: str) -> str:
 # --- agents ----------------------------------------------------------------
 # Each returns (reply, exit_code) or raises Failed / TimeoutExpired.
 
-def ask_codex(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
+def ask_codex(prompt: str, cwd: Path, timeout: int, agent: Agent) -> tuple[str, int]:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "reply.md"
         # approval_policy=never: otherwise Codex can ask to escalate out of the
@@ -280,7 +289,7 @@ def ask_codex(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
         stdout, stderr, code = run(
             ["codex", "exec", "--sandbox", "read-only", "-c", 'approval_policy="never"',
              "--skip-git-repo-check", "--color", "never", "-o", str(out), "-"],
-            cwd, timeout, prompt,
+            cwd, timeout, prompt, agent,
         )
         reply = out.read_text(encoding="utf-8", errors="replace").strip() if out.exists() else ""
     # codex prints the final message on stdout too; use it if -o came back empty.
@@ -290,11 +299,12 @@ def ask_codex(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
     return reply, code
 
 
-def ask_opencode(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
+def ask_opencode(prompt: str, cwd: Path, timeout: int, agent: Agent) -> tuple[str, int]:
     # The plan agent denies edits but still allows bash. A stricter custom agent
     # or permission override makes OpenCode's free tier refuse the request, so
     # this relies on the model plus the post-round worktree check.
-    stdout, stderr, code = run(["opencode", "run", "--agent", "plan", "--format", "json"], cwd, timeout, prompt)
+    stdout, stderr, code = run(["opencode", "run", "--agent", "plan", "--format", "json"],
+                               cwd, timeout, prompt, agent)
     texts = []
     for line in stdout.splitlines():
         try:
@@ -313,7 +323,7 @@ def ask_opencode(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
     return "\n".join(t["text"] for t in texts if t.get("messageID") == last).strip(), code
 
 
-def ask_grok(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
+def ask_grok(prompt: str, cwd: Path, timeout: int, agent: Agent) -> tuple[str, int]:
     # Grok headless ignores stdin, so the prompt goes through a file.
     # --sandbox is not enforced on Windows and plan mode still lets the shell
     # write, so the tool list itself is restricted to reading. That also avoids
@@ -328,7 +338,7 @@ def ask_grok(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
                 "--sandbox", "read-only", "--permission-mode", "plan",
                 "--output-format", "streaming-messages-json", "--no-auto-update",
             ],
-            cwd, timeout,
+            cwd, timeout, None, agent,
         )
     for line in reversed(stdout.splitlines()):
         try:
@@ -349,19 +359,331 @@ def ask_grok(prompt: str, cwd: Path, timeout: int) -> tuple[str, int]:
     raise Failed(tail(stderr or stdout))
 
 
-# key -> (display name, executable, function)
-AGENTS = {
-    "codex": ("Codex", "codex", ask_codex),
-    "opencode": ("OpenCode", "opencode", ask_opencode),
-    "grok": ("Grok", "grok", ask_grok),
+def ask_custom(prompt: str, cwd: Path, timeout: int, agent: Agent) -> tuple[str, int]:
+    # A user-defined agent: the prompt goes in {prompt_file} if the command
+    # names it, else over stdin; the reply is whatever it prints on stdout.
+    # Read-only is up to that CLI's own flags plus the post-round worktree check.
+    with tempfile.TemporaryDirectory() as tmp:
+        pf = Path(tmp) / "prompt.md"
+        via_file = any("{prompt_file}" in a for a in agent.command)
+        if via_file:
+            pf.write_text(prompt, encoding="utf-8")
+        cmd = [a.replace("{prompt_file}", str(pf)).replace("{cwd}", str(cwd)) for a in agent.command]
+        stdout, stderr, code = run(cmd, cwd, timeout, None if via_file else prompt, agent)
+    if not stdout.strip():
+        raise Failed(tail(stderr or stdout))
+    return stdout.strip(), code
+
+
+# --- agent profiles and config ---------------------------------------------
+
+@dataclass
+class Agent:
+    key: str
+    label: str
+    exe: str
+    fn: Callable
+    command: list[str] = field(default_factory=list)  # custom agents only
+    enabled: bool = True
+    auto_join: bool = True  # joins rounds that @mention nobody; else only when Claude @mentions it
+    cost: str = ""
+    strengths: list[str] = field(default_factory=list)
+    avoid: list[str] = field(default_factory=list)
+    notes: str = ""
+    instructions: str = ""  # private to this agent: a role or standing instruction
+    args: list[str] = field(default_factory=list)
+    timeout: int = TIMEOUT
+    budget: dict[str, int] = field(default_factory=dict)  # BUDGET_KEYS -> max turns
+
+
+BUILTIN = {
+    "codex": ("Codex", ask_codex),
+    "opencode": ("OpenCode", ask_opencode),
+    "grok": ("Grok", ask_grok),
 }
-LABELS = ["Claude", *(label for label, _, _ in AGENTS.values())]
-HEADING = re.compile(rf"^### ({'|'.join(LABELS)}) \(round (\d+)(?:, follow-up \d+)?\)[ \t]*$", re.M)
+# What `--init` writes and the setup skill proposes. Opinions, not facts about
+# the user's plan: cost and budget depend on the account.
+SUGGESTED = {
+    "codex": {
+        "cost": "limited",
+        "strengths": ["backend and APIs", "deep code audits", "concurrency and state machines", "tests"],
+        "notes": "Thorough and precise but slow. Enforced read-only sandbox; can run read-only commands such as git log.",
+    },
+    "opencode": {
+        "cost": "free",
+        "strengths": ["quick second opinions", "frontend and UI code", "docs and developer experience"],
+        "notes": "Quality depends on the configured model. Has a shell, so it can run read-only commands.",
+    },
+    "grok": {
+        "cost": "free",
+        "strengths": ["security review", "devil's advocate", "web lookups (docs, CVEs, changelogs)", "broad sweeps"],
+        "notes": "No shell: reads, greps and searches the web, but can't run git or scripts. Usually the slowest.",
+    },
+}
+COSTS = {
+    "free": "free, @mention freely",
+    "cheap": "cheap, @mention when useful",
+    "limited": "limited, @mention only when its strengths are needed",
+    "expensive": "expensive, @mention only for decisive questions",
+}
+# Turn budgets: per transcript, and over rolling windows tracked in usage.json.
+BUDGET_KEYS = {"per_discussion": None, "per_day": 86400, "per_week": 7 * 86400}
+FIELDS = {
+    "enabled": bool, "auto_join": bool, "cost": str, "strengths": list, "avoid": list, "notes": str,
+    "instructions": str, "args": list, "timeout": int, "budget": dict, "label": str, "command": list,
+}
+# A repo's .agent-council.json may only describe how agents fit that project.
+# Commands, args, cost and budgets belong to the user's own accounts and machine:
+# a cloned repo must not be able to run programs or loosen a sandbox.
+PROJECT_FIELDS = {"enabled", "auto_join", "strengths", "avoid", "notes", "instructions"}
+DEFAULTS = {"agents": list, "hops": int, "timeout": int, "prompt_chars": int}
+PROJECT_DEFAULTS = {"agents", "hops"}
+LABEL_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,30}$")
+
+
+def config_paths(cwd: Path) -> tuple[Path, Path]:
+    """(user config, project config). COUNCIL_CONFIG overrides the user file."""
+    if os.environ.get("COUNCIL_CONFIG"):
+        user = Path(os.environ["COUNCIL_CONFIG"]).expanduser()
+    else:
+        user = state_dir() / "config.json"
+    return user, cwd / ".agent-council.json"
+
+
+def state_dir() -> Path:
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        base = Path(os.environ["APPDATA"])
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "agent-council"
+
+
+def _read_json(path: Path, warnings: list[str]) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        warnings.append(f"{path}: ignored, not valid JSON ({exc})")
+        return {}
+    if not isinstance(data, dict):
+        warnings.append(f"{path}: ignored, top level must be an object")
+        return {}
+    return data
+
+
+def _checked(entry: dict, allowed: dict | set, where: str, warnings: list[str]) -> dict:
+    """The fields of entry that are allowed and of the right type."""
+    out = {}
+    for name, value in entry.items():
+        if name not in allowed:
+            if name in FIELDS or name in DEFAULTS:
+                warnings.append(f"{where}: ignored {name!r}, which only the user config may set")
+            else:
+                warnings.append(f"{where}: ignored unknown field {name!r}")
+            continue
+        kind = (FIELDS | DEFAULTS)[name]
+        if value is not None and not (isinstance(value, kind) and not (kind is int and isinstance(value, bool))):
+            warnings.append(f"{where}: ignored {name!r}, expected {kind.__name__}")
+            continue
+        if kind is list and value is not None and not all(isinstance(v, str) for v in value):
+            warnings.append(f"{where}: ignored {name!r}, expected a list of strings")
+            continue
+        out[name] = value
+    return out
+
+
+def load_config(cwd: Path) -> tuple[dict[str, Agent], dict, list[str], list[str]]:
+    """(agents by key, defaults, config files loaded, warnings).
+
+    Built-in agents always exist (enabled unless the config says otherwise);
+    custom agents need a "command" in the user config.
+    """
+    warnings: list[str] = []
+    user_path, project_path = config_paths(cwd)
+    loaded = []
+    layers = []
+    for path, fields, defaults in ((user_path, FIELDS, DEFAULTS), (project_path, PROJECT_FIELDS, PROJECT_DEFAULTS)):
+        data = _read_json(path, warnings)
+        if data:
+            loaded.append(str(path))
+        for name in data:
+            if name not in ("agents", "defaults", "$schema", "_comment"):
+                warnings.append(f"{path}: ignored unknown top-level field {name!r}")
+        agents = data.get("agents") or {}
+        if not isinstance(agents, dict):
+            warnings.append(f"{path}: ignored \"agents\", expected an object keyed by agent name")
+            agents = {}
+        checked = {}
+        for key, entry in agents.items():
+            if not isinstance(entry, dict):
+                warnings.append(f"{path}: ignored agent {key!r}, expected an object")
+                continue
+            checked[key.lower()] = _checked(entry, fields, f"{path} agents.{key}", warnings)
+        dflt = data.get("defaults") or {}
+        layers.append((path, checked, _checked(dflt, defaults, f"{path} defaults", warnings)
+                       if isinstance(dflt, dict) else {}))
+
+    defaults: dict = {}
+    for _, _, d in layers:
+        defaults.update({k: v for k, v in d.items() if v is not None})
+    base_timeout = int(os.environ["COUNCIL_TIMEOUT"]) if os.environ.get("COUNCIL_TIMEOUT") else \
+        defaults.get("timeout", TIMEOUT)
+
+    agents: dict[str, Agent] = {k: Agent(k, label, k, fn, timeout=base_timeout) for k, (label, fn) in BUILTIN.items()}
+    for path, entries, _ in layers:
+        is_user = path == user_path
+        for key, entry in entries.items():
+            if key not in agents:
+                if not is_user:
+                    warnings.append(f"{path}: ignored agent {key!r}; new agents can only be added in the user config")
+                    continue
+                label = entry.get("label") or key.capitalize()
+                if not entry.get("command"):
+                    warnings.append(f"{path}: ignored agent {key!r}: a custom agent needs \"command\"")
+                    continue
+                agents[key] = Agent(key, label, entry["command"][0], ask_custom, timeout=base_timeout)
+            a = agents[key]
+            for name, value in entry.items():
+                if value is None:
+                    continue
+                if name == "label":
+                    if a.fn is not ask_custom and value != a.label:
+                        warnings.append(f"{path} agents.{key}: built-in agents keep their label")
+                    continue
+                if name == "command":
+                    if a.fn is not ask_custom:
+                        warnings.append(f"{path} agents.{key}: \"command\" is only for custom agents")
+                        continue
+                    a.exe = value[0]
+                if name == "cost" and value not in COSTS:
+                    warnings.append(f"{path} agents.{key}: unknown cost {value!r} (use {', '.join(COSTS)})")
+                    continue
+                if name == "budget":
+                    value = _budget(value, f"{path} agents.{key}.budget", warnings)
+                setattr(a, name, value)
+
+    # Labels become heading and @mention syntax, so they must be distinct words.
+    seen = {"claude", "all"}
+    for key, a in list(agents.items()):
+        if not LABEL_OK.match(a.label) or a.label.lower() in seen or key in seen:
+            warnings.append(f"agent {key!r}: label {a.label!r} is invalid or taken; agent ignored")
+            del agents[key]
+            continue
+        seen.update({a.label.lower(), key})
+    return agents, defaults, loaded, warnings
+
+
+def _budget(value: dict, where: str, warnings: list[str]) -> dict[str, int]:
+    out = {}
+    for name, limit in value.items():
+        if name not in BUDGET_KEYS:
+            warnings.append(f"{where}: ignored {name!r} (use {', '.join(BUDGET_KEYS)})")
+        elif limit is None:
+            continue
+        elif isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            warnings.append(f"{where}: ignored {name!r}, expected a whole number >= 0 or null")
+        else:
+            out[name] = limit
+    return out
+
+
+class Usage:
+    """Turn timestamps per agent, for the rolling per_day / per_week budgets.
+
+    Shared by every council on this machine. Concurrent rounds can race and
+    lose a count; that only makes the budget slightly generous.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.turns = self._load()
+
+    def _load(self) -> dict[str, list[float]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            turns = data.get("turns", {})
+            return {k: [float(t) for t in v] for k, v in turns.items() if isinstance(v, list)}
+        except (OSError, ValueError, AttributeError, TypeError):
+            return {}
+
+    def count(self, key: str, seconds: float) -> int:
+        cutoff = time.time() - seconds
+        return sum(1 for t in self.turns.get(key, []) if t >= cutoff)
+
+    def record(self, key: str) -> None:
+        self.turns = self._load()  # pick up rounds that ran in parallel
+        horizon = time.time() - max(s for s in BUDGET_KEYS.values() if s)
+        self.turns[key] = [t for t in self.turns.get(key, []) if t >= horizon] + [time.time()]
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"turns": self.turns}), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"[council] could not save budget usage to {self.path}: {exc}", file=sys.stderr)
+
+
+def turns_left(agent: Agent, text: str, usage: Usage) -> tuple[int | None, str]:
+    """(turns left under the tightest budget or None if unlimited, human summary)."""
+    left, parts = None, []
+    for name, limit in agent.budget.items():
+        if BUDGET_KEYS[name] is None:
+            used = sum(1 for m in headings(text) if m.group(1) == agent.label)
+            where = "this discussion"
+        else:
+            used = usage.count(agent.key, BUDGET_KEYS[name])
+            where = "24h" if name == "per_day" else "7d"
+        parts.append(f"{max(limit - used, 0)}/{limit} {where}")
+        left = limit - used if left is None else min(left, limit - used)
+    return (None if left is None else max(left, 0)), ", ".join(parts)
+
+
+def profile_lines(keys: list[str], text: str, usage: Usage) -> str:
+    """The participants block of the prompt: strengths, cost and budget per agent."""
+    lines = []
+    for key in keys:
+        a = AGENTS[key]
+        bits = []
+        if a.strengths:
+            bits.append("best at " + ", ".join(a.strengths))
+        if a.avoid:
+            bits.append("weak at " + ", ".join(a.avoid))
+        if a.cost:
+            bits.append(f"budget {COSTS[a.cost]}")
+        left, _ = turns_left(a, text, usage)
+        if left is not None and left <= 2:
+            bits.append(f"nearly out of budget ({left} turn{'s' if left != 1 else ''} left), "
+                        "avoid @mentioning unless essential")
+        if a.notes:
+            bits.append(a.notes.rstrip("."))
+        if bits:
+            lines.append(f"- {a.label}: " + "; ".join(bits) + ".")
+    if not lines:
+        return ""
+    return ("\nParticipants, as profiled by the user (use this to decide whom to @mention,\n"
+            "and to weigh claims outside an agent's strengths more carefully):\n" + "\n".join(lines) + "\n")
+
+
+AGENTS: dict[str, Agent] = {}
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # A code span: a backtick run, then anything up to the same-length run, within one paragraph.
 INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)*?)(?<!`)\1(?!`)", re.S)
-# "@codex", "@Grok," ... but not emails, paths or "x@grok".
-MENTION = re.compile(rf"(?<![\w@./\\-])@({'|'.join(LABELS)}|all)\b", re.I)
+
+
+def set_agents(agents: dict[str, Agent]) -> None:
+    """Install the agent set, and the heading and @mention patterns built from its labels."""
+    global AGENTS, LABELS, LABEL_KEY, HEADING, MENTION
+    AGENTS = agents
+    LABELS = ["Claude", *(a.label for a in agents.values())]
+    LABEL_KEY = {a.label.lower(): k for k, a in agents.items()}
+    alts = "|".join(re.escape(label) for label in LABELS)
+    HEADING = re.compile(rf"^### ({alts}) \(round (\d+)(?:, follow-up \d+)?\)[ \t]*$", re.M)
+    # "@codex", "@Grok," ... but not emails, paths or "x@grok".
+    MENTION = re.compile(rf"(?<![\w@./\\-])@({alts}|all)(?![\w-])", re.I)
+
+
+set_agents({k: Agent(k, label, k, fn) for k, (label, fn) in BUILTIN.items()})
 NO_REPLY = re.compile(r"\(no reply: [^\n]*?(?:unavailable: (\w+))?\)")
 STATUS = re.compile(r"^[\s*_`-]*status[*_`]*\s*[:\-]\s*[*_`]*\s*(AGREE|DISAGREE|NEED-INFO)\b", re.I)
 
@@ -410,8 +732,9 @@ def prose_lines(text: str) -> list[tuple[str, str]]:
 
 
 def mentions(text: str) -> list[str]:
-    """Lower-cased mention targets ("codex", "claude", "all", ...) in order of first use."""
-    found = [m.group(1).lower() for line, _ in prose_lines(text) for m in MENTION.finditer(line)]
+    """Mention targets as agent keys, or "claude" / "all", in order of first use."""
+    found = [LABEL_KEY.get(m.group(1).lower(), m.group(1).lower())
+             for line, _ in prose_lines(text) for m in MENTION.finditer(line)]
     return list(dict.fromkeys(found))
 
 
@@ -429,12 +752,13 @@ def unavailable_reason(error: str) -> str | None:
     return None
 
 
-def ask(label: str, fn, prompt: str, cwd: Path) -> tuple[str, float]:
+def ask(agent: Agent, prompt: str, cwd: Path) -> tuple[str, float]:
+    label = agent.label
     start = time.monotonic()
-    timeout = TIMEOUT
+    timeout = agent.timeout
     for attempt in (1, 2):
         try:
-            reply, code = fn(prompt, cwd, timeout)
+            reply, code = agent.fn(prompt, cwd, timeout, agent)
             # Models sometimes echo their own heading; the script already writes it.
             reply = close_fences(re.sub(rf"^### {label}\b[^\n]*\n+", "", reply.lstrip()))
             if code:
@@ -453,11 +777,11 @@ def ask(label: str, fn, prompt: str, cwd: Path) -> tuple[str, float]:
             if attempt == 1 and RATE_LIMITED.search(str(exc)):
                 print(f"[council] {label} rate limited, retrying once in {RATE_LIMIT_WAIT}s", file=sys.stderr, flush=True)
                 time.sleep(RATE_LIMIT_WAIT)
-                timeout = RETRY_TIMEOUT
+                timeout = min(RETRY_TIMEOUT, agent.timeout)
                 continue
             if attempt == 1 and time.monotonic() - start < FAST_FAIL:
                 print(f"[council] {label} failed fast, retrying once: {str(exc)[:200]}", file=sys.stderr, flush=True)
-                timeout = RETRY_TIMEOUT
+                timeout = min(RETRY_TIMEOUT, agent.timeout)
                 continue
             break
     took = time.monotonic() - start
@@ -542,7 +866,81 @@ def worktree_fingerprint(cwd: Path, exclude: Path) -> str | None:
     return h.hexdigest()
 
 
+def check(cwd: Path, as_json: bool, loaded: list[str], warnings: list[str]) -> None:
+    """--check: what's installed, how each agent is profiled and how much budget is left."""
+    usage = Usage(config_paths(cwd)[0].with_name("usage.json"))
+    user_path, project_path = config_paths(cwd)
+    rows = []
+    for key, a in AGENTS.items():
+        left, summary = turns_left(a, "", usage)
+        rows.append({
+            "key": key, "label": a.label, "path": shutil.which(a.exe), "custom": a.fn is ask_custom,
+            "enabled": a.enabled, "auto_join": a.auto_join, "cost": a.cost or None,
+            "strengths": a.strengths, "avoid": a.avoid, "notes": a.notes, "has_instructions": bool(a.instructions),
+            "budget": a.budget, "budget_left": summary or None, "timeout": a.timeout,
+        })
+    if as_json:
+        print(json.dumps({
+            "user_config": str(user_path), "project_config": str(project_path), "loaded": loaded,
+            "warnings": warnings, "agents": rows, "suggested": SUGGESTED, "costs": list(COSTS),
+            "budget_keys": list(BUDGET_KEYS),
+        }, indent=2))
+        return
+    for path in (user_path, project_path):
+        print(f"config: {path} ({'loaded' if str(path) in loaded else 'not found'})")
+    for w in warnings:
+        print(f"  warning: {w}")
+    print()
+    for r in rows:
+        state = "NOT FOUND" if not r["path"] else r["path"]
+        if not r["enabled"]:
+            state = f"disabled in config ({state})"
+        print(f"{r['label']:9} {state}")
+        extras = []
+        if r["cost"]:
+            extras.append(f"cost {r['cost']}")
+        if r["budget_left"]:
+            extras.append(f"left {r['budget_left']}")
+        if not r["auto_join"]:
+            extras.append("joins only when @mentioned")
+        if r["has_instructions"]:
+            extras.append("has a role")
+        if extras:
+            print(f"{'':9} {' | '.join(extras)}")
+        if r["strengths"]:
+            print(f"{'':9} best at: {', '.join(r['strengths'])}")
+        if r["avoid"]:
+            print(f"{'':9} weak at: {', '.join(r['avoid'])}")
+    if not loaded:
+        print("\nNo config yet: every installed agent is used with no profile. "
+              "Run with --init, or ask Claude for /agent-council:setup.")
+
+
+def init(cwd: Path, force: bool) -> None:
+    """--init: write a starter user config from SUGGESTED, enabling installed agents."""
+    path = config_paths(cwd)[0]
+    if path.exists() and not force:
+        sys.exit(f"council.py: {path} already exists (use --force to overwrite)")
+    agents = {}
+    for key, (label, _) in BUILTIN.items():
+        agents[key] = {
+            "enabled": shutil.which(key) is not None, "auto_join": True, **SUGGESTED[key],
+            "budget": {"per_discussion": None, "per_day": None, "per_week": None},
+            "args": [], "instructions": "",
+        }
+    config = {
+        "_comment": "agent-council config. cost: free | cheap | limited | expensive. budget: max turns, "
+                    "null = unlimited. Project-specific strengths go in <repo>/.agent-council.json.",
+        "defaults": {"hops": HOPS, "timeout": TIMEOUT},
+        "agents": agents,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {path}")
+
+
 def main() -> None:
+    global PROMPT_BUDGET
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -554,53 +952,83 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Group discussion between Claude and other coding agents.")
     ap.add_argument("transcript", nargs="?", type=Path, help="transcript .md file (created if missing)")
     ap.add_argument("message", nargs="*", help="Claude's message for this round (default: stdin)")
-    ap.add_argument(
-        "--agents",
-        default=os.environ.get("COUNCIL_AGENTS", ",".join(AGENTS)),
-        help=f"comma-separated subset of {','.join(AGENTS)} (default: all installed; env COUNCIL_AGENTS)",
-    )
+    ap.add_argument("--agents", help="comma-separated pool for messages without @mentions "
+                    "(default: enabled agents with auto_join; env COUNCIL_AGENTS)")
     ap.add_argument("--cwd", type=Path, help="repository the agents inspect (default: git root of the current dir)")
-    ap.add_argument("--hops", type=int, default=HOPS,
+    ap.add_argument("--hops", type=int,
                     help="follow-up turns agent @mentions may trigger per round (default 1; env COUNCIL_HOPS; 0 = none)")
-    ap.add_argument("--check", action="store_true", help="list which agents are installed and exit")
+    ap.add_argument("--check", action="store_true", help="show installed agents, profiles and budgets, then exit")
+    ap.add_argument("--json", action="store_true", help="with --check: machine-readable output")
+    ap.add_argument("--init", action="store_true", help="write a starter user config, then exit")
+    ap.add_argument("--force", action="store_true", help="with --init: overwrite an existing config")
     args = ap.parse_intermixed_args()
 
-    if args.check:
-        for label, exe, _ in AGENTS.values():
-            print(f"{label:9} {shutil.which(exe) or 'NOT FOUND'}")
+    cwd = (args.cwd or git_root(Path.cwd())).resolve()
+    agents, defaults, loaded, warnings = load_config(cwd)
+    set_agents(agents)
+    if args.init:
+        init(cwd, args.force)
         return
+    if args.check:
+        check(cwd, args.json, loaded, warnings)
+        return
+    for w in warnings:
+        print(f"[council] config warning: {w}", file=sys.stderr)
     if args.transcript is None:
         ap.error("transcript path is required")
 
-    wanted = [a.strip().lower() for a in args.agents.split(",") if a.strip()]
+    # Precedence: flag > environment > project config > user config > built-in default.
+    hops = args.hops if args.hops is not None else \
+        int(os.environ["COUNCIL_HOPS"]) if os.environ.get("COUNCIL_HOPS") else defaults.get("hops", HOPS)
+    if not os.environ.get("COUNCIL_PROMPT_CHARS") and "prompt_chars" in defaults:
+        PROMPT_BUDGET = defaults["prompt_chars"]
+    pool = args.agents or os.environ.get("COUNCIL_AGENTS")
+    if pool:
+        wanted = [a.strip().lower() for a in pool.split(",") if a.strip()]
+    elif "agents" in defaults:
+        wanted = [a.lower() for a in defaults["agents"]]
+    else:
+        wanted = [k for k, a in AGENTS.items() if a.auto_join]
     unknown = [a for a in wanted if a not in AGENTS]
     if unknown:
         ap.error(f"unknown agent(s): {', '.join(unknown)} (choose from {', '.join(AGENTS)})")
-    installed = {key for key, (_, exe, _) in AGENTS.items() if shutil.which(exe)}
+    disabled = {key for key, a in AGENTS.items() if not a.enabled}
+    installed = {key for key, a in AGENTS.items() if shutil.which(a.exe)}
 
     msg = " ".join(args.message) or sys.stdin.read()
     if not msg.strip():
         sys.exit("empty message")
 
+    transcript = args.transcript
+    text = transcript.read_text(encoding="utf-8-sig", errors="replace") if transcript.exists() else ""
+    if not text:
+        text = f"# Council transcript\n\nRepository: `{cwd}`\n"
+    usage = Usage(config_paths(cwd)[0].with_name("usage.json"))
+
+    def spent(key: str) -> bool:
+        return turns_left(AGENTS[key], text, usage)[0] == 0
+
     # @mentions in the message pick who answers; none (or @all) means every selected agent.
     named = mentions(msg)
     targets = [m for m in named if m in AGENTS] if "all" not in named else []
     targets = targets or wanted
-    missing = [AGENTS[key][0] for key in targets if key not in installed]
-    if missing:
-        print(f"[council] not installed, skipping: {', '.join(missing)}", file=sys.stderr)
-    targets = [key for key in targets if key in installed]
+    for why, drop in (("disabled in config", disabled), ("not installed", AGENTS.keys() - installed)):
+        skipped = [AGENTS[key].label for key in targets if key in drop]
+        if skipped:
+            print(f"[council] {why}, skipping: {', '.join(skipped)}", file=sys.stderr)
+        targets = [key for key in targets if key not in drop]
+    over = [key for key in targets if spent(key)]
+    if over:
+        print("[council] out of budget, skipping: "
+              + ", ".join(f"{AGENTS[k].label} ({turns_left(AGENTS[k], text, usage)[1]})" for k in over),
+              file=sys.stderr)
+        targets = [key for key in targets if key not in over]
     if not targets:
-        sys.exit("council.py: none of the selected agents are installed")
+        sys.exit("council.py: none of the selected agents are enabled, installed and within budget "
+                 "(see --check)")
 
     _install_cleanup()
-    cwd = (args.cwd or git_root(Path.cwd())).resolve()
-    transcript = args.transcript
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    text = transcript.read_text(encoding="utf-8-sig", errors="replace") if transcript.exists() else ""
-    if not text:
-        text = f"# Council transcript\n\nRepository: `{cwd}`\n"
-
     heads = headings(text)
     round_no = max((int(m.group(2)) for m in heads), default=0) + 1
     if heads and heads[-1].group(1) == "Claude":
@@ -614,35 +1042,39 @@ def main() -> None:
     transcript.write_text(text, encoding="utf-8")
 
     # Agents can pull in each other only from the pool (--agents) plus whoever Claude named.
-    allowed = [key for key in AGENTS if key in installed and (key in wanted or key in targets)]
+    allowed = [key for key in AGENTS if key in installed and key not in disabled and not spent(key)
+               and (key in wanted or key in targets)]
     participants = list(targets)
-    print(f"[council] round {round_no}: asking {', '.join(AGENTS[k][0] for k in targets)} in {cwd} "
-          f"(timeout {TIMEOUT}s, follow-ups {args.hops})", file=sys.stderr, flush=True)
+    print(f"[council] round {round_no}: asking {', '.join(AGENTS[k].label for k in targets)} in {cwd} "
+          f"(follow-ups {hops})", file=sys.stderr, flush=True)
 
     before = worktree_fingerprint(cwd, transcript)
     latest: dict[str, tuple[str, float]] = {}  # agent -> (last reply, total seconds this round)
     to_claude: list[tuple[str, str]] = []
     unanswered: dict[str, list[str]] = {}
-    batch = {key: TASK.format(name=AGENTS[key][0], round=round_no) for key in targets}
+    batch = {key: TASK.format(name=AGENTS[key].label, round=round_no) for key in targets}
     hop = 0
     while batch:
-        roster = ", ".join(["Claude", *(AGENTS[k][0] for k in participants)])
-        mentionable = ", ".join([*(f"@{AGENTS[key][0]}" for key in allowed), "@Claude"])
+        roster = ", ".join(["Claude", *(AGENTS[k].label for k in participants)])
+        mentionable = ", ".join([*(f"@{AGENTS[key].label}" for key in allowed), "@Claude"])
+        profiles = profile_lines(list(dict.fromkeys([*participants, *allowed])), text, usage)
         view = prompt_view(text, round_no, transcript)
         if view is not text and hop == 0:
             print(f"[council] transcript is {len(text)} chars; collapsed old replies to {len(view)} for the prompt",
                   file=sys.stderr)
-        with ThreadPoolExecutor(len(batch)) as pool:
+        with ThreadPoolExecutor(len(batch)) as pool_:
             futures = [
-                (key, pool.submit(ask, AGENTS[key][0], AGENTS[key][2], PROMPT.format(
-                    name=AGENTS[key][0], roster=roster, mentionable=mentionable, cwd=cwd,
-                    transcript=view, task=task), cwd))
+                (key, pool_.submit(ask, AGENTS[key], PROMPT.format(
+                    name=AGENTS[key].label, roster=roster, mentionable=mentionable, cwd=cwd,
+                    role=f"\nYour role, set by the user: {AGENTS[key].instructions.strip()}\n"
+                    if AGENTS[key].instructions.strip() else "",
+                    profiles=profiles, transcript=view, task=task), cwd))
                 for key, task in batch.items()
             ]
             results = [(key, *f.result()) for key, f in futures]
 
         suffix = f", follow-up {hop}" if hop else ""
-        replies = "".join(f"\n### {AGENTS[key][0]} (round {round_no}{suffix})\n\n{reply}\n"
+        replies = "".join(f"\n### {AGENTS[key].label} (round {round_no}{suffix})\n\n{reply}\n"
                           for key, reply, _ in results)
         text += replies
         with transcript.open("a", encoding="utf-8") as fh:
@@ -653,35 +1085,41 @@ def main() -> None:
         callers: dict[str, list[str]] = {}
         for key, reply, took in results:
             latest[key] = (reply, latest.get(key, ("", 0.0))[1] + took)
-            if status_of(reply).startswith("UNAVAILABLE") and key in allowed:
-                # Out of quota or logged out: don't offer or ask it again this round.
-                allowed.remove(key)
-                print(f"[council] {AGENTS[key][0]} is {status_of(reply).lower()}; skipping it for the rest of "
-                      "this round", file=sys.stderr)
+            if status_of(reply).startswith("UNAVAILABLE"):
+                if key in allowed:
+                    # Out of quota or logged out: don't offer or ask it again this round.
+                    allowed.remove(key)
+                    print(f"[council] {AGENTS[key].label} is {status_of(reply).lower()}; skipping it for the rest "
+                          "of this round", file=sys.stderr)
+            else:
+                usage.record(key)  # a failed or timed-out turn may still have spent credits
+                if key in allowed and spent(key):
+                    allowed.remove(key)
+                    print(f"[council] {AGENTS[key].label} has used up its budget", file=sys.stderr)
             if reply.startswith("(no reply"):
                 continue
-            label = AGENTS[key][0]
+            label = AGENTS[key].label
             # Detect on the searchable copy, show the original so code spans survive.
             to_claude += [(label, original.strip()) for line, original in prose_lines(reply)
                           if any(m.group(1).lower() == "claude" for m in MENTION.finditer(line))]
             for m in mentions(reply):
                 if m in AGENTS and m != key:
                     callers.setdefault(m, []).append(label)
-        skipped = [AGENTS[k][0] for k in callers if k not in allowed]
+        skipped = [AGENTS[k].label for k in callers if k not in allowed]
         if skipped:
-            print(f"[council] mentioned but not available (not installed, not in --agents, or out of quota): "
-                  f"{', '.join(skipped)}", file=sys.stderr)
+            print(f"[council] mentioned but not available (disabled, not installed, not in the pool, "
+                  f"out of quota or out of budget): {', '.join(skipped)}", file=sys.stderr)
         callers = {k: who for k, who in callers.items() if k in allowed}
         hop += 1
-        if callers and hop > args.hops:
+        if callers and hop > hops:
             unanswered = callers
             break
-        batch = {key: FOLLOW_UP_TASK.format(callers=" and ".join(who), name=AGENTS[key][0], round=round_no)
+        batch = {key: FOLLOW_UP_TASK.format(callers=" and ".join(who), name=AGENTS[key].label, round=round_no)
                  for key, who in callers.items()}
         participants += [k for k in batch if k not in participants]
         if batch:
             print(f"[council] follow-up {hop}: asking "
-                  + ", ".join(f"{AGENTS[k][0]} (mentioned by {' and '.join(w)})" for k, w in callers.items()),
+                  + ", ".join(f"{AGENTS[k].label} (mentioned by {' and '.join(w)})" for k, w in callers.items()),
                   file=sys.stderr, flush=True)
 
     # Checked after the replies are saved, so a slow git cannot lose them.
@@ -704,10 +1142,16 @@ def main() -> None:
         for label, line in to_claude:
             print(f"  {label}: {line if len(line) <= 600 else line[:600] + ' …'}")
     if unanswered:
-        print(f"--- not asked (follow-up limit {args.hops}): "
-              + ", ".join(f"{AGENTS[k][0]} <- {' and '.join(w)}" for k, w in unanswered.items()))
-    summary = " | ".join(f"{AGENTS[key][0]}: {status_of(reply)} ({took:.0f}s)" for key, (reply, took) in latest.items())
-    print(f"--- round {round_no} status: {summary}\n--- transcript: {transcript.resolve()}")
+        print(f"--- not asked (follow-up limit {hops}): "
+              + ", ".join(f"{AGENTS[k].label} <- {' and '.join(w)}" for k, w in unanswered.items()))
+    summary = " | ".join(f"{AGENTS[key].label}: {status_of(reply)} ({took:.0f}s)"
+                         for key, (reply, took) in latest.items())
+    print(f"--- round {round_no} status: {summary}")
+    budgets = [f"{a.label} {turns_left(a, text, usage)[1]}" for k, a in AGENTS.items()
+               if a.budget and k in installed and k not in disabled]
+    if budgets:
+        print(f"--- budget left: {' | '.join(budgets)}")
+    print(f"--- transcript: {transcript.resolve()}")
 
 
 if __name__ == "__main__":
